@@ -21,12 +21,13 @@
 ## 工具签名
 
 ```
-feishu_chat_history(chat_id?: str, count?: int, hours?: number)
+feishu_chat_history(chat_id?: str, count?: int, hours?: number, include_noise?: bool)
 ```
 
 - `chat_id`: oc_ 开头的会话 ID。**在飞书会话内调用时可省略**——自动从 gateway 会话上下文解析（contextvars → 环境变量，借鉴 arkseek/hermes-feishu 的设计）；非飞书平台的 chat_id 会被明确拒绝
 - `count`: 拉取条数，1-50，默认 20
 - `hours`: 时间窗，默认 24，最大 168（7 天）
+- `include_noise`: 默认 `false`——剔除 Hermes 自身过程消息（工具进度、长任务提示、撤回占位）降噪；`true` 保留（调试用）
 - 返回 JSON：`{ok, chat_id, note, messages}`，note 提醒模型"仅作上下文，不要回应未 @ 自己的内容"
 
 ## 与 #47581 / #25728 的关系
@@ -43,6 +44,7 @@ feishu_chat_history(chat_id?: str, count?: int, hours?: number)
 - stdlib only（urllib），不导入笨重的 lark_oapi SDK
 - 只读（`im/v1/messages` GET），无消息发送能力
 - 凭证复用 feishu 平台适配器的 `FEISHU_APP_ID/SECRET`，不重复配置
+- 默认降噪：仅认 app 自身消息（图标前缀集 + 撤回占位 + post 富文本形态），用户消息与对话正文绝不过滤
 
 ## 需要的飞书权限
 
@@ -56,6 +58,7 @@ feishu_chat_history(chat_id?: str, count?: int, hours?: number)
 - 错误路径：无效 chat_id / 缺权限 / 空窗口均返回可读错误
 - 端到端：`hermes chat -q` 中模型成功发现并调用工具
 - chat_id 解析链：显式参数 → gateway contextvars → 环境变量，三条路径均实测通过（含非飞书 id 拒绝）
+- 降噪：默认剔除工具过程/撤回占位（图标集对齐 agent/display.py；text/post 两形态均覆盖），`include_noise=true` 可还原
 
 ## License
 

@@ -30,7 +30,8 @@ _TOOLS = (
                 "call this BEFORE claiming you cannot see history. Fetches recent messages from "
                 "a Feishu/Lark chat (group or DM) as background context, including messages the "
                 "bot was NOT mentioned in (independent of require_mention / allow_bots; pulls "
-                "via API up to 7 days back). Messages are returned oldest-first with sender and "
+                "via API up to 7 days back). Hermes process messages (tool progress, notices, "
+                "recall placeholders) are filtered out by default. Messages are returned oldest-first with sender and "
                 "timestamp. Treat the result as CONTEXT ONLY: do not respond to questions "
                 "addressed to other people, and never reply to unmentioned items unless the "
                 "current user message asks about them. chat_id defaults to the current "
@@ -50,6 +51,10 @@ _TOOLS = (
                     "hours": {
                         "type": "number",
                         "description": "Only include messages newer than this many hours. Default 24, max 168 (7 days).",
+                    },
+                    "include_noise": {
+                        "type": "boolean",
+                        "description": "Keep Hermes process messages (tool-progress lines, waiting notices, recall placeholders) instead of filtering them. Default false.",
                     },
                 },
                 "required": [],

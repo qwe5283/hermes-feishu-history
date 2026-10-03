@@ -23,6 +23,16 @@ _TOKEN_TTL_SECONDS = 5400  # Feishu tenant tokens live ~2h; refresh well before
 _MAX_COUNT = 50
 _MAX_HOURS = 168.0
 
+# Hermes process/notice artifacts that are not conversation. Curated from the
+# tool-line emojis in agent/display.py (plus waiting/session notices); only
+# messages the app itself sent are eligible. Extend as new markers appear.
+_PROCESS_PREFIXES: Tuple[str, ...] = (
+    "💻", "📖", "📄", "📚", "🔎", "🔍", "🐍", "✍️", "🔧", "🌐", "📸", "👆",
+    "⌨️", "◀️", "🖼️", "👁️", "🎨", "🔊", "📨", "⏰", "🔀", "⚙️", "💾", "💭",
+    "⏳", "✨", "⚡", "🧠",
+)
+_RECALL_TOMBSTONES = {"This message was recalled", "此消息已被撤回"}
+
 _token_cache: Dict[str, Any] = {"token": "", "expires": 0.0}
 
 
@@ -100,10 +110,54 @@ def _fetch_messages(chat_id: str, count: int) -> Tuple[Optional[list], Optional[
     return (data.get("data") or {}).get("items") or [], None
 
 
-def _format_items(items: list, cutoff_ms: float, max_chars: int) -> str:
-    """Render newest-first items as an oldest-first readable transcript."""
+def _post_text(content: Any) -> str:
+    """Flatten a post (rich-text) message body into readable plain text."""
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except (TypeError, ValueError):
+            return content
+    if not isinstance(content, dict):
+        return str(content)
+    parts = []
+    for para in content.get("content") or []:
+        if not isinstance(para, list):
+            continue
+        for el in para:
+            if not isinstance(el, dict):
+                continue
+            tag = el.get("tag")
+            if tag == "at":
+                parts.append(f"@{el.get('user_name') or el.get('user_id') or ''}")
+            elif tag == "img":
+                parts.append("[图片]")
+            else:
+                txt = el.get("text")
+                if txt:
+                    parts.append(str(txt))
+        parts.append("\n")
+    return "".join(parts).strip()
+
+
+def _is_process_noise(sender_type: str, text: str) -> bool:
+    """True for Hermes process artifacts rather than conversation: tool-progress
+    lines / waiting notices (emoji-prefixed) and recall tombstones. Only app
+    messages are eligible, so user text is never filtered."""
+    if sender_type != "app":
+        return False
+    stripped = text.strip()
+    return stripped in _RECALL_TOMBSTONES or stripped.startswith(_PROCESS_PREFIXES)
+
+
+def _format_items(items: list, cutoff_ms: float, max_chars: int,
+                  include_noise: bool = False, max_items: int = 0) -> str:
+    """Render newest-first items as an oldest-first readable transcript.
+    Drops recalled items and Hermes process messages unless include_noise;
+    keeps at most max_items (the newest) when set."""
     kept = []
     for it in items:
+        if it.get("deleted") is True:  # recalled: content is gone
+            continue
         try:
             ts_ms = float(it.get("create_time") or 0)
             if 0 < ts_ms < 1e12:  # seconds → normalize to ms (Feishu returns ms)
@@ -114,6 +168,8 @@ def _format_items(items: list, cutoff_ms: float, max_chars: int) -> str:
             continue
         kept.append((ts_ms / 1000.0, it))  # store as seconds for display/sort
     kept.sort(key=lambda pair: pair[0])
+    if max_items and len(kept) > max_items:
+        kept = kept[-max_items:]  # keep the newest max_items
 
     lines = []
     used = 0
@@ -123,19 +179,25 @@ def _format_items(items: list, cutoff_ms: float, max_chars: int) -> str:
         msg_type = it.get("msg_type") or "?"
         body_raw = it.get("body")
         if isinstance(body_raw, dict):
-            body = body_raw.get("content") or ""
+            raw_content = body_raw.get("content") or ""
         else:
             try:
-                body = json.loads(body_raw or "{}").get("content") or ""
+                raw_content = json.loads(body_raw or "{}").get("content") or ""
             except (TypeError, ValueError):
-                body = str(body_raw or "")
-        if msg_type == "text" and isinstance(body, str):
+                raw_content = str(body_raw or "")
+        if msg_type == "text" and isinstance(raw_content, str):
             try:
-                body = json.loads(body).get("text", body)
+                text = json.loads(raw_content).get("text", raw_content)
             except (TypeError, ValueError):
-                pass
+                text = raw_content
+        elif msg_type == "post":
+            text = _post_text(raw_content)
+        else:
+            text = str(raw_content)
+        if not include_noise and _is_process_noise(sender_type, str(text)):
+            continue
         when = time.strftime("%m-%d %H:%M", time.localtime(ts_ms)) if ts_ms else "?"
-        body = str(body).replace("\n", " ")[:200]
+        body = str(text).replace("\n", " ")[:200]
         line = f"[{when}] {sender}({sender_type}) {msg_type}: {body}"
         if used + len(line) > max_chars:
             lines.append("…(older messages truncated)")
@@ -196,17 +258,21 @@ def handle_chat_history(args: dict, **_: Any) -> str:
     except (TypeError, ValueError):
         hours = 24.0
     hours = max(0.0, min(hours, _MAX_HOURS))
+    include_noise = bool(args.get("include_noise"))
 
     chat_id, err = _resolve_chat_id(args)
     if err:
         return json.dumps({"error": err})
 
     try:
-        items, err = _fetch_messages(chat_id, count)
+        # Over-fetch 2×: recalled/process items are dropped after filtering and
+        # we still want up to `count` real messages when the chat is noisy.
+        items, err = _fetch_messages(chat_id, min(_MAX_COUNT, count * 2))
         if err is not None:
             return json.dumps({"error": f"Feishu API error: {err}"})
         cutoff_ms = (time.time() - hours * 3600) * 1000 if hours else 0.0
-        transcript = _format_items(items or [], cutoff_ms, max_chars=12000)
+        transcript = _format_items(items or [], cutoff_ms, max_chars=12000,
+                                   include_noise=include_noise, max_items=count)
         if not transcript:
             return json.dumps({"ok": True, "chat_id": chat_id,
                                "messages": "No messages in the requested window."})
