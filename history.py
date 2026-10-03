@@ -88,8 +88,12 @@ def _tenant_token() -> str:
 
 def _fetch_messages(chat_id: str, count: int) -> Tuple[Optional[list], Optional[str]]:
     """Newest-first page of chat messages, or (None, error)."""
+    # sort_type is explicit on purpose: without it the API defaults to oldest-first,
+    # so the first page of a long-lived chat can predate any recent window entirely
+    # (the time-window cut then leaves nothing, even for busy chats).
     url = (f"{_domain()}/open-apis/im/v1/messages"
-           f"?container_id_type=chat&container_id={chat_id}&page_size={min(count, 50)}")
+           f"?container_id_type=chat&container_id={chat_id}&page_size={min(count, 50)}"
+           f"&sort_type=ByCreateTimeDesc")
     data = _http_json(url, _tenant_token())
     if data.get("code") != 0:
         return None, f"{data.get('code')}: {data.get('msg')}"
