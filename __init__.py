@@ -6,6 +6,10 @@ Tools:
   mentioned in (require_mention=true means unmentioned messages are dropped
   upstream and never reach the session).
 
+v1.2.0: also registers a pre_gateway_dispatch hook that auto-injects recent
+group history as channel_context on triggered messages (lurker-mode backfill,
+Telegram observe-style; DMs excluded).
+
 Read-only: uses GET /open-apis/im/v1/messages with the app's tenant token.
 Credentials come from the same FEISHU_APP_ID / FEISHU_APP_SECRET env the
 feishu platform adapter already uses — no duplicate configuration.
@@ -14,6 +18,7 @@ feishu platform adapter already uses — no duplicate configuration.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
@@ -78,3 +83,12 @@ def register(ctx) -> None:
             check_fn=history.check_available,
             emoji=emoji,
         )
+    # Lurker-mode backfill hook (v1.2.0). Cores without plugin-hook support
+    # (or with the hook disabled) keep the manual tool — never fatal.
+    register_hook = getattr(ctx, "register_hook", None)
+    if register_hook is not None:
+        try:
+            register_hook("pre_gateway_dispatch", history.auto_inject_hook)
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger("plugins.feishu-history").warning(
+                "pre_gateway_dispatch hook not registered: %s", exc)

@@ -1,5 +1,5 @@
 name: feishu-history
-version: "1.1.0"
+version: "1.2.0"
 description: "Fetch recent Feishu/Lark group chat history as on-demand context. Lets the agent backfill context when a user references discussions the bot never saw (lurker mode complement to require_mention)."
 author: qwe5283
 kind: standalone

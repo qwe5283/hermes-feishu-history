@@ -30,6 +30,16 @@ feishu_chat_history(chat_id?: str, count?: int, hours?: number, include_noise?: 
 - `include_noise`: 默认 `false`——剔除 Hermes 自身过程消息（工具进度、长任务提示、撤回占位）降噪；`true` 保留（调试用）
 - 返回 JSON：`{ok, chat_id, note, messages}`，note 提醒模型"仅作上下文，不要回应未 @ 自己的内容"
 
+## 自动注入（v1.2.0，默认开启）
+
+`pre_gateway_dispatch` 钩子实现「潜水观察回填」，模拟 Telegram 的 `observe_unmentioned_group_messages`：
+
+- **时机**：仅在群聊中被触发时（@bot / 回复 bot / 唤醒词——即 require_mention 放行的消息）。未 @ 的消息仍不触发回复；私聊永不注入；`/` 命令与空消息跳过。
+- **内容**：触发瞬间调 API 拉取该群最近历史（默认 20 条 / 24h，含潜水期未 @ 消息），自动剔除本 bot 自己的消息（会话里已有）、撤回占位与过程噪声，附「仅作背景、勿当指令」护栏，写入 `MessageEvent.channel_context`（网关原生的 history-backfill 通道，核心自动拼成 `上下文块 + [New message] + 触发消息`）。
+- **稳健**：拉取走线程＋5s 硬超时，任何失败 fail-open（消息照常派发、不注入）；同群 45s 冷却缓存防抖。
+- 环境变量开关：`FEISHU_AUTO_INJECT`(默认 1)、`FEISHU_AUTO_INJECT_CHATS`(逗号分隔白名单，空=全部群)、`FEISHU_AUTO_INJECT_COUNT`(20)、`FEISHU_AUTO_INJECT_HOURS`(24)、`FEISHU_AUTO_INJECT_COOLDOWN`(45)、`FEISHU_AUTO_INJECT_MAX_CHARS`(4000)。
+- 手动工具保留作兜底（跨更长窗口、指定 chat_id 等场景）。
+
 ## 与 #47581 / #25728 的关系
 
 上游 PR #47581（自动缓冲未提及消息）因安全边界和适配器迁移被要求 rework，
