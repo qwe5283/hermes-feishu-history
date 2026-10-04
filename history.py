@@ -109,18 +109,35 @@ def _tenant_token() -> str:
     return _token_cache["token"]
 
 
-def _fetch_messages(chat_id: str, count: int) -> Tuple[Optional[list], Optional[str]]:
-    """Newest-first page of chat messages, or (None, error)."""
+def _fetch_messages(chat_id: str, count: int, max_pages: int = 4) -> Tuple[Optional[list], Optional[str]]:
+    """Newest-first messages (paginate until `count` gathered or no more pages).
+
+    page_size is capped at 50 by the API; without a page_token walk a busy chat
+    silently truncates at 50, dropping the older half of a recent window.
+    max_pages bounds the walk (4 pages = up to 200 items) so a huge chat can
+    neither loop forever nor hammer the API.
+    """
     # sort_type is explicit on purpose: without it the API defaults to oldest-first,
     # so the first page of a long-lived chat can predate any recent window entirely
     # (the time-window cut then leaves nothing, even for busy chats).
-    url = (f"{_domain()}/open-apis/im/v1/messages"
-           f"?container_id_type=chat&container_id={chat_id}&page_size={min(count, 50)}"
-           f"&sort_type=ByCreateTimeDesc")
-    data = _http_json(url, _tenant_token())
-    if data.get("code") != 0:
-        return None, f"{data.get('code')}: {data.get('msg')}"
-    return (data.get("data") or {}).get("items") or [], None
+    items: list = []
+    token = ""
+    for page in range(max(1, max_pages)):
+        url = (f"{_domain()}/open-apis/im/v1/messages"
+               f"?container_id_type=chat&container_id={chat_id}&page_size=50"
+               f"&sort_type=ByCreateTimeDesc")
+        if token:
+            url += f"&page_token={token}"
+        data = _http_json(url, _tenant_token())
+        if data.get("code") != 0:
+            # First page failing = real error; later pages failing = keep what we have.
+            return (None, f"{data.get('code')}: {data.get('msg')}") if page == 0 else (items, None)
+        payload = data.get("data") or {}
+        items.extend(payload.get("items") or [])
+        token = str(payload.get("page_token") or "")
+        if len(items) >= count or not token or not payload.get("has_more"):
+            break
+    return items[:count] if count > 0 else items, None
 
 
 def _post_text(content: Any) -> str:
@@ -265,7 +282,7 @@ def handle_chat_history(args: dict, **_: Any) -> str:
         count = int(args.get("count") or 20)
     except (TypeError, ValueError):
         count = 20
-    count = max(1, min(count, _MAX_COUNT))
+    count = max(1, min(count, 200))  # per-page cap is 50; pagination (up to 4 pages) serves up to 200
     try:
         hours = float(args.get("hours") or 24)
     except (TypeError, ValueError):
@@ -280,7 +297,9 @@ def handle_chat_history(args: dict, **_: Any) -> str:
     try:
         # Over-fetch 2×: recalled/process items are dropped after filtering and
         # we still want up to `count` real messages when the chat is noisy.
-        items, err = _fetch_messages(chat_id, min(_MAX_COUNT, count * 2))
+        # count>50 pages (up to 4 pages / 200 items) to reach older history.
+        want = min(count * 2, 200)
+        items, err = _fetch_messages(chat_id, want)
         if err is not None:
             return json.dumps({"error": f"Feishu API error: {err}"})
         cutoff_ms = (time.time() - hours * 3600) * 1000 if hours else 0.0

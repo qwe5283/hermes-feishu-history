@@ -51,7 +51,7 @@ _TOOLS = (
                     },
                     "count": {
                         "type": "integer",
-                        "description": "How many recent messages to fetch (1-50). Default 20.",
+                        "description": "How many recent messages to fetch (1-200; auto-paginates past the 50/page API cap). Default 20.",
                     },
                     "hours": {
                         "type": "number",
