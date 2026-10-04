@@ -46,7 +46,9 @@ logger = logging.getLogger("plugins.feishu-history")
 # backfill" slot (consumed in run_inbound as context + [New message] + text).
 # DMs are never injected; untriggered messages never reach this hook at all.
 _INJECT_CACHE: Dict[str, Dict[str, Any]] = {}
-_INJECT_SEEN: Dict[str, Dict[str, set]] = {}  # chat_id -> {"injected": ids, "dispatched": ids}
+# Keyed by SESSION KEY (not chat_id): with group_sessions_per_user=true each member
+# has their own session, so dedup state must not leak across members.
+_INJECT_SEEN: Dict[str, Dict[str, set]] = {}  # session_key -> {"injected": ids, "dispatched": ids}
 _INJECT_FETCH_TIMEOUT = 5.0  # hard budget; fail-open past it
 
 
@@ -400,7 +402,8 @@ def _dispatched_message_ids(session_store: Any, source: Any) -> set:
 
 
 def _build_inject_context(chat_id: str, trigger_message_id: Optional[str],
-                          cfg: Dict[str, Any]) -> str:
+                          cfg: Dict[str, Any], skey: str = "",
+                          seen: Optional[Dict[str, set]] = None) -> str:
     """Sync fetch+format (runs on a worker thread). Fail-open: "" = no injection.
 
     Dedup across turns (Telegram-observe equivalence): a message enters the
@@ -410,10 +413,11 @@ def _build_inject_context(chat_id: str, trigger_message_id: Optional[str],
     latter and the next block is a full snapshot again — self-healing.
     """
     now = time.time()
-    cached = _INJECT_CACHE.get(chat_id)
+    cache_key = skey or chat_id
+    cached = _INJECT_CACHE.get(cache_key)
     if cached and now - cached["ts"] < cfg["cooldown"]:
         return cached["text"]
-    seen = _INJECT_SEEN.setdefault(chat_id, {"injected": set(), "dispatched": set()})
+    seen = seen if seen is not None else _INJECT_SEEN.setdefault(cache_key, {"injected": set(), "dispatched": set()})
 
     items, err = _fetch_messages(chat_id, min(_MAX_COUNT, cfg["count"] * 2))
     if err or not items:
@@ -452,7 +456,7 @@ def _build_inject_context(chat_id: str, trigger_message_id: Optional[str],
         mid = str(it.get("message_id") or "")
         if mid:
             seen["injected"].add(mid)
-    _INJECT_CACHE[chat_id] = {"ts": now, "text": text}
+    _INJECT_CACHE[cache_key] = {"ts": now, "text": text}
     return text
 
 
@@ -484,16 +488,25 @@ async def auto_inject_hook(event, gateway=None, session_store=None, **kwargs):
         if not chat_id or (cfg["chats"] and chat_id not in cfg["chats"]):
             return None
 
+        # Dedup domain = the SESSION this message dispatches into (not the chat):
+        # with group_sessions_per_user=true each member holds a separate session,
+        # so member A's injected/dispatched ids must not suppress member B's blocks.
+        skey = ""
+        try:
+            from gateway.session import build_session_key
+            skey = build_session_key(src) or ""
+        except Exception:
+            skey = ""
+        seen = _INJECT_SEEN.setdefault(skey or chat_id, {"injected": set(), "dispatched": set()})
         # Messages already dispatched into this session's transcript must not
         # come back as background (continuous-conversation noise).
-        seen = _INJECT_SEEN.setdefault(chat_id, {"injected": set(), "dispatched": set()})
         seen["dispatched"].update(_dispatched_message_ids(session_store, src))
         if getattr(event, "message_id", None):
             seen["dispatched"].add(str(event.message_id))
-        _trim_seen(chat_id)
+        _trim_seen(skey or chat_id)
         context = await asyncio.wait_for(
             asyncio.to_thread(_build_inject_context, chat_id,
-                              getattr(event, "message_id", None), cfg),
+                              getattr(event, "message_id", None), cfg, skey, seen),
             timeout=_INJECT_FETCH_TIMEOUT)
         if context:
             event.channel_context = context  # native backfill slot; core prepends "[New message]"

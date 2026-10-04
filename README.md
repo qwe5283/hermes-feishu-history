@@ -40,6 +40,20 @@ feishu_chat_history(chat_id?: str, count?: int, hours?: number, include_noise?: 
 - 环境变量开关：`FEISHU_AUTO_INJECT`(默认 1)、`FEISHU_AUTO_INJECT_CHATS`(逗号分隔白名单，空=全部群)、`FEISHU_AUTO_INJECT_COUNT`(20)、`FEISHU_AUTO_INJECT_HOURS`(24)、`FEISHU_AUTO_INJECT_COOLDOWN`(45)、`FEISHU_AUTO_INJECT_MAX_CHARS`(4000)。
 - 手动工具保留作兜底（跨更长窗口、指定 chat_id 等场景）。
 
+## 与 group_sessions_per_user 的搭配（建议设为 false）
+
+Hermes 网关默认 `group_sessions_per_user: true`——同一群里每个成员各持一个独立会话。对本插件的影响：
+
+- 去重按「当前触发者的会话」判定（与会话 key 同域，成员间互不污染）：每个成员**首次**触发都会注入一份该成员未见过的完整背景——行为正确，但群内多人使用时上下文按人重复注入、token 成本随人数放大。
+- 设为 `false`（全群共享一个会话）时与本插件语义最契合，等价于 Telegram observe 模式的「群共享观察会话」：任一成员触发后群转写即含该上下文，后续任何成员的触发只注入真正的新消息；上下文体积与 token 成本最小，连续多人对话不产生重复。
+
+```yaml
+# ~/.hermes/config.yaml（gateway 顶层）
+group_sessions_per_user: false
+```
+
+注意：该开关影响的是**所有平台群聊**的会话粒度，改前请结合你的多群/多平台使用场景权衡。
+
 ## 与 #47581 / #25728 的关系
 
 上游 PR #47581（自动缓冲未提及消息）因安全边界和适配器迁移被要求 rework，
