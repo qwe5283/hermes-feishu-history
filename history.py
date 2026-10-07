@@ -112,8 +112,14 @@ def _tenant_token() -> str:
     return _token_cache["token"]
 
 
-def _fetch_messages(chat_id: str, count: int, max_pages: int = 4) -> Tuple[Optional[list], Optional[str]]:
+def _fetch_messages(chat_id: str, count: int, max_pages: int = 4,
+                     container_type: str = "chat") -> Tuple[Optional[list], Optional[str]]:
     """Newest-first messages (paginate until `count` gathered or no more pages).
+
+    container_type: "chat" (whole chat) or "thread" (one topic; chat_id must be
+    an omt_ thread id). Topic groups must query the thread container — the chat
+    container flattens every topic in the group into one stream, which would
+    leak other topics' conversations into unrelated sessions.
 
     page_size is capped at 50 by the API; without a page_token walk a busy chat
     silently truncates at 50, dropping the older half of a recent window.
@@ -126,8 +132,9 @@ def _fetch_messages(chat_id: str, count: int, max_pages: int = 4) -> Tuple[Optio
     items: list = []
     token = ""
     for page in range(max(1, max_pages)):
+        ctype = container_type if container_type in ("chat", "thread") else "chat"
         url = (f"{_domain()}/open-apis/im/v1/messages"
-               f"?container_id_type=chat&container_id={chat_id}&page_size=50"
+               f"?container_id_type={ctype}&container_id={chat_id}&page_size=50"
                f"&sort_type=ByCreateTimeDesc")
         if token:
             url += f"&page_token={token}"
@@ -207,7 +214,10 @@ def _format_items(items: list, cutoff_ms: float, max_chars: int,
     lines = []
     used = 0
     for ts_ms, it in kept:
-        sender = ((it.get("sender") or {}).get("id")) or "unknown"
+        sender = ((it.get("sender") or {}).get("id")) or ""
+        if not sender:  # system events (group_created, photo changes): not conversation
+            continue
+        sender = sender or "unknown"
         sender_type = (it.get("sender") or {}).get("sender_type") or "?"
         msg_type = it.get("msg_type") or "?"
         body_raw = it.get("body")
@@ -297,12 +307,35 @@ def handle_chat_history(args: dict, **_: Any) -> str:
     if err:
         return json.dumps({"error": err})
 
+    # Topic groups: default to the current thread container so the transcript
+    # matches the conversation the session belongs to (the whole-chat flatten
+    # would pull in every other topic). Explicit chat_id/thread_id wins.
+    container_type = "chat"
+    explicit_thread = str(args.get("thread_id") or "").strip()
+    if explicit_thread:
+        if not explicit_thread.startswith("omt_"):
+            return json.dumps({"error": "thread_id must start with omt_ (topic id)"})
+        container_type, chat_id = "thread", explicit_thread
+    elif str(args.get("container_id_type") or "").strip() == "thread":
+        if not chat_id.startswith("omt_"):
+            return json.dumps({"error": "container_id_type=thread requires an omt_ topic id "
+                                        "(pass thread_id=omt_... or call inside a topic)"})
+        container_type = "thread"
+    elif not str(args.get("chat_id") or "").strip():
+        try:
+            from gateway.session_context import get_session_env
+            tid = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+        except Exception:
+            tid = ""
+        if tid.startswith("omt_"):
+            container_type, chat_id = "thread", tid
+
     try:
         # Over-fetch 2×: recalled/process items are dropped after filtering and
         # we still want up to `count` real messages when the chat is noisy.
         # count>50 pages (up to 4 pages / 200 items) to reach older history.
         want = min(count * 2, 200)
-        items, err = _fetch_messages(chat_id, want)
+        items, err = _fetch_messages(chat_id, want, container_type=container_type)
         if err is not None:
             return json.dumps({"error": f"Feishu API error: {err}"})
         cutoff_ms = (time.time() - hours * 3600) * 1000 if hours else 0.0
@@ -314,6 +347,7 @@ def handle_chat_history(args: dict, **_: Any) -> str:
         return json.dumps({
             "ok": True,
             "chat_id": chat_id,
+            "container_id_type": container_type,
             "note": ("CONTEXT ONLY — group history the bot was not mentioned in. "
                      "Do not respond to unmentioned items unless the current user "
                      "message references them."),
@@ -403,7 +437,8 @@ def _dispatched_message_ids(session_store: Any, source: Any) -> set:
 
 def _build_inject_context(chat_id: str, trigger_message_id: Optional[str],
                           cfg: Dict[str, Any], skey: str = "",
-                          seen: Optional[Dict[str, set]] = None) -> str:
+                          seen: Optional[Dict[str, set]] = None,
+                          container_type: str = "chat") -> str:
     """Sync fetch+format (runs on a worker thread). Fail-open: "" = no injection.
 
     Dedup across turns (Telegram-observe equivalence): a message enters the
@@ -419,7 +454,8 @@ def _build_inject_context(chat_id: str, trigger_message_id: Optional[str],
         return cached["text"]
     seen = seen if seen is not None else _INJECT_SEEN.setdefault(cache_key, {"injected": set(), "dispatched": set()})
 
-    items, err = _fetch_messages(chat_id, min(_MAX_COUNT, cfg["count"] * 2))
+    items, err = _fetch_messages(chat_id, min(_MAX_COUNT, cfg["count"] * 2),
+                                  container_type=container_type)
     if err or not items:
         return ""
 
@@ -497,6 +533,18 @@ async def auto_inject_hook(event, gateway=None, session_store=None, **kwargs):
             skey = build_session_key(src) or ""
         except Exception:
             skey = ""
+
+        # Topic groups: fetch the THREAD container, not the chat. The chat
+        # container flattens all topics into one stream, so background blocks
+        # would leak other topics' conversations into this session — the exact
+        # opposite of the lurker-context this plugin exists to provide. With
+        # require_mention=false every in-topic message already dispatches into
+        # the session, so the thread-scoped block dedups to empty (a no-op);
+        # with require_mention=true the block carries the topic's own prior
+        # discussion, which is the context the model actually needs.
+        thread_id = str(getattr(src, "thread_id", "") or "").strip()
+        if thread_id.startswith("omt_"):
+            chat_id = thread_id
         seen = _INJECT_SEEN.setdefault(skey or chat_id, {"injected": set(), "dispatched": set()})
         # Messages already dispatched into this session's transcript must not
         # come back as background (continuous-conversation noise).
@@ -504,9 +552,11 @@ async def auto_inject_hook(event, gateway=None, session_store=None, **kwargs):
         if getattr(event, "message_id", None):
             seen["dispatched"].add(str(event.message_id))
         _trim_seen(skey or chat_id)
+        container = "thread" if chat_id.startswith("omt_") else "chat"
         context = await asyncio.wait_for(
             asyncio.to_thread(_build_inject_context, chat_id,
-                              getattr(event, "message_id", None), cfg, skey, seen),
+                              getattr(event, "message_id", None), cfg, skey, seen,
+                              container_type=container),
             timeout=_INJECT_FETCH_TIMEOUT)
         if context:
             event.channel_context = context  # native backfill slot; core prepends "[New message]"
